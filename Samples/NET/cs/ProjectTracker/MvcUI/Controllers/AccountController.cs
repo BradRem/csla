@@ -1,15 +1,13 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Security.Claims;
 using System.Threading.Tasks;
 using System.Web;
 using System.Web.Mvc;
 using Microsoft.AspNet.Identity;
-using Microsoft.AspNet.Identity.EntityFramework;
 using Microsoft.Owin.Security;
 using MvcUI.Models;
-using ProjectTracker.Library.Security;
+using Microsoft.AspNet.Identity.Owin;
 
 namespace MvcUI.Controllers
 {
@@ -18,16 +16,26 @@ namespace MvcUI.Controllers
   public class AccountController : Controller
   {
     public AccountController()
-      : this(new UserManager<PTApplicationUser>(new UserStore<PTApplicationUser>()))
     {
     }
 
-    public AccountController(UserManager<PTApplicationUser> userManager)
+    public AccountController(ApplicationUserManager userManager)
     {
       UserManager = userManager;
     }
 
-    public UserManager<PTApplicationUser> UserManager { get; private set; }
+    private ApplicationUserManager _userManager;
+    public ApplicationUserManager UserManager
+    {
+      get
+      {
+        return _userManager ?? HttpContext.GetOwinContext().GetUserManager<ApplicationUserManager>();
+      }
+      private set
+      {
+        _userManager = value;
+      }
+    }
 
     //
     // GET: /Account/Login
@@ -36,6 +44,20 @@ namespace MvcUI.Controllers
     {
       ViewBag.ReturnUrl = returnUrl;
       return View();
+    }
+
+    private SignInHelper _helper;
+
+    private SignInHelper SignInHelper
+    {
+      get
+      {
+        if (_helper == null)
+        {
+          _helper = new SignInHelper(UserManager, AuthenticationManager);
+        }
+        return _helper;
+      }
     }
 
     //
@@ -47,17 +69,35 @@ namespace MvcUI.Controllers
     {
       if (ModelState.IsValid)
       {
-        bool result = PTPrincipal.Login(model.UserName, model.Password);
-        var user = new MvcUI.Models.PTApplicationUser((ProjectTracker.Library.Security.PTIdentity)Csla.ApplicationContext.User.Identity);
-        if (result && user != null)
+        //bool result = PTPrincipal.Login(model.UserName, model.Password);
+        //var user = new MvcUI.Models.ApplicationUser((ProjectTracker.Library.Security.PTIdentity)Csla.ApplicationContext.User.Identity);
+        //if (result && user != null)
+        //{
+        //  await SignInAsync(user, model.RememberMe);
+        //  return RedirectToLocal(returnUrl);
+        //}
+        //else
+        //{
+        //  ModelState.AddModelError("", "Invalid username or password.");
+        //}
+
+        // This doen't count login failures towards lockout only two factor authentication
+        // To enable password failures to trigger lockout, change to shouldLockout: true
+        var result = await SignInHelper.PasswordSignIn(model.UserName, model.Password, model.RememberMe, shouldLockout: false);
+        switch (result)
         {
-          await SignInAsync(user, model.RememberMe);
-          return RedirectToLocal(returnUrl);
+          case SignInStatus.Success:
+            return RedirectToLocal(returnUrl);
+          case SignInStatus.LockedOut:
+            return View("Lockout");
+          case SignInStatus.RequiresTwoFactorAuthentication:
+            return RedirectToAction("SendCode", new { ReturnUrl = returnUrl });
+          case SignInStatus.Failure:
+          default:
+            ModelState.AddModelError("", "Invalid login attempt.");
+            return View(model);
         }
-        else
-        {
-          ModelState.AddModelError("", "Invalid username or password.");
-        }
+      
       }
 
       // If we got this far, something failed, redisplay form
@@ -172,18 +212,21 @@ namespace MvcUI.Controllers
       }
 
       // Sign in the user with this external login provider if the user already has a login
-      var user = await UserManager.FindAsync(loginInfo.Login);
-      if (user != null)
+      var result = await SignInHelper.ExternalSignIn(loginInfo, isPersistent: false);
+      switch (result)
       {
-        await SignInAsync(user, isPersistent: false);
-        return RedirectToLocal(returnUrl);
-      }
-      else
-      {
-        // If the user does not have an account, then prompt the user to create an account
-        ViewBag.ReturnUrl = returnUrl;
-        ViewBag.LoginProvider = loginInfo.Login.LoginProvider;
-        return View("ExternalLoginConfirmation", new ExternalLoginConfirmationViewModel { UserName = loginInfo.DefaultUserName });
+        case SignInStatus.Success:
+          return RedirectToLocal(returnUrl);
+        case SignInStatus.LockedOut:
+          return View("Lockout");
+        case SignInStatus.RequiresTwoFactorAuthentication:
+          return RedirectToAction("SendCode", new { ReturnUrl = returnUrl });
+        case SignInStatus.Failure:
+        default:
+          // If the user does not have an account, then prompt the user to create an account
+          ViewBag.ReturnUrl = returnUrl;
+          ViewBag.LoginProvider = loginInfo.Login.LoginProvider;
+          return View("ExternalLoginConfirmation", new ExternalLoginConfirmationViewModel { UserName = loginInfo.Email });
       }
     }
 
@@ -234,14 +277,14 @@ namespace MvcUI.Controllers
         {
           return View("ExternalLoginFailure");
         }
-        var user = new PTApplicationUser() { UserName = model.UserName };
+        var user = new ApplicationUser() { UserName = model.UserName };
         var result = await UserManager.CreateAsync(user);
         if (result.Succeeded)
         {
           result = await UserManager.AddLoginAsync(user.Id, info.Login);
           if (result.Succeeded)
           {
-            await SignInAsync(user, isPersistent: false);
+            await SignInHelper.SignInAsync(user, isPersistent: false, rememberBrowser: false);
             return RedirectToLocal(returnUrl);
           }
         }
@@ -280,10 +323,10 @@ namespace MvcUI.Controllers
 
     protected override void Dispose(bool disposing)
     {
-      if (disposing && UserManager != null)
+      if (disposing && _userManager != null)
       {
-        UserManager.Dispose();
-        UserManager = null;
+        _userManager.Dispose();
+        _userManager = null;
       }
       base.Dispose(disposing);
     }
@@ -298,13 +341,6 @@ namespace MvcUI.Controllers
       {
         return HttpContext.GetOwinContext().Authentication;
       }
-    }
-
-    private async Task SignInAsync(PTApplicationUser user, bool isPersistent)
-    {
-      AuthenticationManager.SignOut(DefaultAuthenticationTypes.ExternalCookie);
-      var identity = await UserManager.CreateIdentityAsync(user, DefaultAuthenticationTypes.ApplicationCookie);
-      AuthenticationManager.SignIn(new AuthenticationProperties() { IsPersistent = isPersistent }, identity);
     }
 
     private void AddErrors(IdentityResult result)
